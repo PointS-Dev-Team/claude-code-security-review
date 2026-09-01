@@ -57,9 +57,14 @@ class ClaudeAPIClient:
             Tuple of (success, error_message)
         """
         try:
-            # Simple test call to verify API access
+            # Fork patch: was hard-coded to claude-3-5-haiku-20241022, retired
+            # 2026-02-19. Every call 404'd, and the caller in findings_filter.py
+            # treats a failed preflight as "no Claude filtering" with a warning to
+            # stderr only, so false-positive filtering was silently off. Validate
+            # with the model we are actually going to call.
+            # Upstream: anthropics/claude-code-security-review#127.
             self.client.messages.create(
-                model="claude-3-5-haiku-20241022",
+                model=self.model,
                 max_tokens=10,
                 messages=[{"role": "user", "content": "Hello"}],
                 timeout=10
