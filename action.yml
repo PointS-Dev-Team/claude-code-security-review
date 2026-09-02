@@ -33,6 +33,11 @@ inputs:
     required: false
     default: ''
 
+  claude-cli-version:
+    description: 'Version of @anthropic-ai/claude-code to install (npm version or dist-tag). Empty uses the pinned default in the install step.'
+    required: false
+    default: ''
+
   run-every-commit:
     description: 'Run ClaudeCode on every commit (skips cache check). Warning: This may lead to more false positives on PRs with many commits as the AI analyzes the same code multiple times.'
     required: false
@@ -164,17 +169,25 @@ runs:
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
+        INPUT_CLI_VERSION: ${{ inputs.claude-cli-version }}
       run: |
         echo "::group::Install Deps"
         if [ "${{ steps.claudecode-check.outputs.enable_claudecode }}" == "true" ]; then
           pip install -r "$ACTION_PATH/claudecode/requirements.txt"
-          # Fork patch: was unpinned. Every `uses:` in this file is pinned to a SHA
-          # and the Python deps come from a requirements file, but the CLI that
-          # actually performs the scan floated on latest — so a release that
-          # changes flag semantics would break the gate silently, in a repo whose
-          # last upstream push was 2026-02-11. Overridable via CLAUDE_CLI_VERSION
-          # for callers that want to drive it; the literal is what runs otherwise.
-          npm install -g "@anthropic-ai/claude-code@${CLAUDE_CLI_VERSION:-2.1.144}"
+          # Fork patch: was unpinned, so this resolved `latest` on every run — the one
+          # floating dependency in a file that pins every `uses:` to a SHA, and the
+          # component that actually performs the scan. A release changing flag semantics
+          # (this action passes --disallowed-tools among others) would break the gate
+          # with no upstream maintainer to respond; last upstream push was 2026-02-11.
+          #
+          # 2.1.236 is the current `stable` dist-tag (published 2026-08-19), resolved to
+          # an exact version because tags float. Deliberately not `latest` (moves under
+          # us) and not the 2.1.144 our self-hosted runners pin, which is 3.5 months old
+          # and constrained by a different job's needs, not this one's.
+          #
+          # Precedence: the claude-cli-version input, then a CLAUDE_CLI_VERSION env var
+          # set by the calling job, then this literal.
+          npm install -g "@anthropic-ai/claude-code@${INPUT_CLI_VERSION:-${CLAUDE_CLI_VERSION:-2.1.236}}"
         fi
         sudo apt-get update && sudo apt-get install -y jq
         echo "::endgroup::"
