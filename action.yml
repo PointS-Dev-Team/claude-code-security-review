@@ -168,7 +168,13 @@ runs:
         echo "::group::Install Deps"
         if [ "${{ steps.claudecode-check.outputs.enable_claudecode }}" == "true" ]; then
           pip install -r "$ACTION_PATH/claudecode/requirements.txt"
-          npm install -g @anthropic-ai/claude-code
+          # Fork patch: was unpinned. Every `uses:` in this file is pinned to a SHA
+          # and the Python deps come from a requirements file, but the CLI that
+          # actually performs the scan floated on latest — so a release that
+          # changes flag semantics would break the gate silently, in a repo whose
+          # last upstream push was 2026-02-11. Overridable via CLAUDE_CLI_VERSION
+          # for callers that want to drive it; the literal is what runs otherwise.
+          npm install -g "@anthropic-ai/claude-code@${CLAUDE_CLI_VERSION:-2.1.144}"
         fi
         sudo apt-get update && sudo apt-get install -y jq
         echo "::endgroup::"
