@@ -163,7 +163,13 @@ runs:
       if: steps.claudecode-check.outputs.enable_claudecode == 'true'
       uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0 pinned to commit hash
       with:
-        node-version: '18'
+        # Fork patch: was '18'. The CLI installed below declares engines
+        # { node: ">=22.0.0" } from 2.1.236 onward (2.1.144 was the last >=18 release),
+        # so on Node 18 npm emitted EBADENGINE and installed anyway — the scan ran on an
+        # unsupported runtime, and would keep running until some release actually used a
+        # Node 22 API. Node 18 also went EOL 2025-04-30. Only the CLI runs on this
+        # runtime; the action's Python steps use setup-python separately.
+        node-version: '22'
     
     - name: Install dependencies
       shell: bash
