@@ -136,7 +136,7 @@ runs:
         RUN_ID: ${{ github.run_id }}
         RUN_NUMBER: ${{ github.run_number }}
       run: |
-        # Create a reservation marker immediately to prevent other concurrent runs
+        # Create the marker; it is saved to the cache only once the scan has run (fork patch, the save step after the scan)
         mkdir -p .claudecode-marker
         cat > .claudecode-marker/marker.json << EOF
         {
@@ -151,13 +151,6 @@ runs:
         }
         EOF
         echo "Created ClaudeCode reservation marker for PR #$PR_NUMBER"
-    
-    - name: Save ClaudeCode reservation to cache
-      if: steps.claudecode-check.outputs.enable_claudecode == 'true' && github.event_name == 'pull_request'
-      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0 pinned to commit hash
-      with:
-        path: .claudecode-marker
-        key: claudecode-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-${{ github.sha }}
     
     - name: Set up Node.js
       if: steps.claudecode-check.outputs.enable_claudecode == 'true'
@@ -300,6 +293,8 @@ runs:
               CLAUDECODE_FINDINGS_COUNT=$(jq -r '.findings | if . == null then 0 else length end' claudecode/claudecode-results.json 2>/dev/null || echo "0")
               echo "::debug::Extracted ClaudeCode findings count: $CLAUDECODE_FINDINGS_COUNT"
               echo "findings_count=$CLAUDECODE_FINDINGS_COUNT" >> $GITHUB_OUTPUT
+              # Fork patch: the scan ran and its results read, so the PR counts as reviewed (the marker step below).
+              echo "scanned=true" >> $GITHUB_OUTPUT
               echo "ClaudeCode found $CLAUDECODE_FINDINGS_COUNT security issues"
               
               # Also create findings.json for PR comment script
@@ -328,8 +323,19 @@ runs:
         fi
         
         echo "::endgroup::"
-    
-    
+
+    # Fork patch: saved after the scan, and only when it ran, where upstream saved it before. The marker makes every
+    # later run of the PR skip the scan, so saved first, a scan that then failed (Claude Code exiting 1, which reads as
+    # 0 findings) left the PR never reviewed: later pushes found the marker and ran nothing. Now a failed scan saves no
+    # marker, and the next push scans again. Concurrent runs of one PR can both scan meanwhile; a workflow that cancels
+    # in progress per PR (as Olympus's does) has none.
+    - name: Save ClaudeCode marker to cache once the scan ran
+      if: steps.claudecode-check.outputs.enable_claudecode == 'true' && github.event_name == 'pull_request' && steps.claudecode-scan.outputs.scanned == 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0 pinned to commit hash
+      with:
+        path: .claudecode-marker
+        key: claudecode-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-${{ github.sha }}
+
     - name: Upload scan results
       if: always() && inputs.upload-results == 'true'
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2 pinned to commit hash
