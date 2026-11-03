@@ -53,6 +53,12 @@ function ghApi(endpoint, method = 'GET', data = null) {
   }
 }
 
+// Identifies a finding by file, line and the category in its comment body
+function findingKey(path, line, body) {
+  const category = (body.match(/\*\*Category:\*\* (.*)/) || [])[1] || '';
+  return `${path}:${line}:${category.trim()}`;
+}
+
 // Helper function to add reactions to a comment
 function addReactionsToComment(commentId, isReviewComment = true) {
   const reactions = ['+1', '-1']; // thumbs up and thumbs down
@@ -173,31 +179,50 @@ async function run() {
       return;
     }
     
-    // Check for existing review comments to avoid duplicates
-    const comments = ghApi(`/repos/${context.repo.owner}/${context.repo.repo}/pulls/${context.issue.number}/comments`);
-    
-    // Check if we've already commented on these findings
-    const existingSecurityComments = comments.filter(comment => 
-      comment.user.type === 'Bot' && 
-      comment.body && comment.body.includes('🤖 **Security Issue:')
+    // Fetch every existing review comment, page by page: a PR scanned at many heads can pass one page
+    const comments = [];
+    for (let page = 1; ; page++) {
+      const pageComments = ghApi(`/repos/${context.repo.owner}/${context.repo.repo}/pulls/${context.issue.number}/comments?per_page=100&page=${page}`);
+      if (!Array.isArray(pageComments)) break;
+      comments.push(...pageComments);
+      if (pageComments.length < 100) break;
+    }
+
+    // Skip only the findings already posted (same file, line and category), so a later head's
+    // new findings still get a comment and a re-scan doesn't repeat the ones already on the PR
+    const postedKeys = new Set(
+      comments
+        .filter(comment =>
+          comment.user && comment.user.type === 'Bot' &&
+          comment.body && comment.body.includes('🤖 **Security Issue:')
+        )
+        .map(comment => findingKey(comment.path, comment.line ?? comment.original_line, comment.body))
     );
-    
-    if (existingSecurityComments.length > 0) {
-      console.log(`Found ${existingSecurityComments.length} existing security comments, skipping to avoid duplicates`);
+
+    const unpostedComments = reviewComments.filter(comment =>
+      !postedKeys.has(findingKey(comment.path, comment.line, comment.body))
+    );
+
+    if (unpostedComments.length < reviewComments.length) {
+      console.log(`Skipping ${reviewComments.length - unpostedComments.length} findings already commented on the PR`);
+    }
+
+    if (unpostedComments.length === 0) {
+      console.log('No new findings to comment on PR diff');
       return;
     }
-        
+
     try {
       // Create a review with all the comments
       const reviewData = {
         commit_id: context.payload.pull_request.head.sha,
         event: 'COMMENT',
-        comments: reviewComments
+        comments: unpostedComments
       };
-      
+
       const reviewResponse = ghApi(`/repos/${context.repo.owner}/${context.repo.repo}/pulls/${context.issue.number}/reviews`, 'POST', reviewData);
-      
-      console.log(`Created review with ${reviewComments.length} inline comments`);
+
+      console.log(`Created review with ${unpostedComments.length} inline comments`);
       
       // Add reactions to the comments
       if (reviewResponse && reviewResponse.id) {
@@ -210,7 +235,7 @@ async function run() {
       // This might happen if line numbers are outside the diff context
       console.log('Attempting fallback with adjusted line numbers...');
       
-      for (const comment of reviewComments) {
+      for (const comment of unpostedComments) {
         try {
           // Try to create comment with the original line
           const commentData = {
