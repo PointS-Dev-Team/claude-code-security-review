@@ -497,6 +497,71 @@ describe('comment-pr-findings.js', () => {
     });
   });
 
+  describe('Existing Comments', () => {
+    const postedComment = {
+      user: { type: 'Bot' },
+      path: 'test.py',
+      line: 10,
+      body: '🤖 **Security Issue: SQL injection**\n\n**Severity:** HIGH\n**Category:** sql_injection\n'
+    };
+
+    function runWithExistingComments(mockFindings, existingComments) {
+      readFileSyncSpy.mockImplementation((path) => {
+        if (path.includes('github-event.json')) {
+          return JSON.stringify({
+            pull_request: { number: 123, head: { sha: 'def456' } }
+          });
+        }
+        if (path === 'findings.json') {
+          return JSON.stringify(mockFindings);
+        }
+      });
+
+      const captured = {};
+      spawnSyncSpy.mockImplementation((cmd, args, options) => {
+        if (cmd === 'gh' && args.includes('api')) {
+          const endpoint = args[1];
+          const method = args[args.indexOf('--method') + 1] || 'GET';
+
+          if (endpoint.includes('/pulls/123/files')) {
+            return { status: 0, stdout: JSON.stringify([{ filename: 'test.py' }]), stderr: '' };
+          }
+          if (endpoint.includes('/pulls/123/comments') && method === 'GET') {
+            return { status: 0, stdout: JSON.stringify(existingComments), stderr: '' };
+          }
+          if (endpoint.includes('/pulls/123/reviews') && method === 'POST') {
+            captured.review = JSON.parse(options.input);
+            return { status: 0, stdout: '{}', stderr: '' };
+          }
+          return { status: 0, stdout: '{}', stderr: '' };
+        }
+        return { status: 0, stdout: '{}', stderr: '' };
+      });
+
+      return import('./comment-pr-findings.js').then(() => captured);
+    }
+
+    test('should comment a later head\'s new finding when an earlier one is already on the PR', async () => {
+      const captured = await runWithExistingComments([
+        { file: 'test.py', line: 10, description: 'SQL injection', category: 'sql_injection' },
+        { file: 'test.py', line: 42, description: 'Command injection', category: 'command_injection' }
+      ], [postedComment]);
+
+      expect(captured.review.commit_id).toBe('def456');
+      expect(captured.review.comments).toHaveLength(1);
+      expect(captured.review.comments[0].line).toBe(42);
+    });
+
+    test('should post nothing when every finding is already on the PR', async () => {
+      const captured = await runWithExistingComments([
+        { file: 'test.py', line: 10, description: 'SQL injection', category: 'sql_injection' }
+      ], [postedComment]);
+
+      expect(captured.review).toBeUndefined();
+      expect(consoleLogSpy).toHaveBeenCalledWith('No new findings to comment on PR diff');
+    });
+  });
+
   describe('Error Handling', () => {
     test('should handle GitHub API errors gracefully', async () => {
      
