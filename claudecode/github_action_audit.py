@@ -12,7 +12,8 @@ import requests
 from typing import Dict, Any, List, Tuple, Optional
 from pathlib import Path
 import re
-import time 
+import time
+import fnmatch
 
 # Import existing components we can reuse
 from claudecode.prompts import get_security_audit_prompt
@@ -57,7 +58,16 @@ class GitHubActionClient:
         self.excluded_dirs = [d.strip() for d in exclude_dirs.split(',') if d.strip()] if exclude_dirs else []
         if self.excluded_dirs:
             print(f"[Debug] Excluded directories: {self.excluded_dirs}", file=sys.stderr)
-    
+
+        # Files left out by name: comma-separated fnmatch patterns on the repository path, where * also crosses a /, so
+        # "*/Migrations/*.Designer.cs" leaves out generated EF Designers in any Migrations folder and nothing else there.
+        exclude_files = os.environ.get('EXCLUDE_FILES', '')
+        self.excluded_file_patterns = [p.strip() for p in exclude_files.split(',') if p.strip()]
+        if self.excluded_file_patterns:
+            print(f"[Debug] Excluded file patterns: {self.excluded_file_patterns}", file=sys.stderr)
+        # The PR's files left out of the scan, by either rule, for the job's summary.
+        self.excluded_files: List[str] = []
+
     def get_pr_data(self, repo_name: str, pr_number: int) -> Dict[str, Any]:
         """Get PR metadata and files from GitHub API.
         
@@ -79,6 +89,7 @@ class GitHubActionClient:
         response = requests.get(files_url, headers=self.headers)
         response.raise_for_status()
         files_data = response.json()
+        self.excluded_files = [f['filename'] for f in files_data if self._is_excluded(f['filename'])]
         
         return {
             'number': pr_data['number'],
@@ -136,7 +147,11 @@ class GitHubActionClient:
         return self._filter_generated_files(response.text)
     
     def _is_excluded(self, filepath: str) -> bool:
-        """Check if a file should be excluded based on directory patterns."""
+        """Check if a file should be excluded based on directory patterns or file patterns."""
+        for pattern in self.excluded_file_patterns:
+            normalized_pattern = pattern[2:] if pattern.startswith('./') else pattern
+            if fnmatch.fnmatchcase(filepath, normalized_pattern):
+                return True
         for excluded_dir in self.excluded_dirs:
             # Normalize excluded directory (remove leading ./ if present)
             if excluded_dir.startswith('./'):
@@ -186,6 +201,10 @@ class GitHubActionClient:
         return ''.join(filtered_sections)
 
 
+# Claude Code's limit on piped stdin, where the prompt goes.
+MAX_STDIN_BYTES = 10 * 1024 * 1024
+
+
 class SimpleClaudeRunner:
     """Simplified Claude Code runner for GitHub Actions."""
     
@@ -217,6 +236,11 @@ class SimpleClaudeRunner:
         prompt_size = len(prompt.encode('utf-8'))
         if prompt_size > 1024 * 1024:  # 1MB
             print(f"[Warning] Large prompt size: {prompt_size / 1024 / 1024:.2f}MB", file=sys.stderr)
+        # Claude Code refuses piped stdin over 10 MB ("piped stdin input exceeds 10MB", exit 1) before it reads the prompt,
+        # so such a prompt goes straight to the caller's retry without the diff, as one it calls too long does.
+        if prompt_size > MAX_STDIN_BYTES:
+            print(f"[Info] Prompt over Claude Code's stdin limit ({prompt_size} bytes), not sent", file=sys.stderr)
+            return False, "PROMPT_TOO_LONG", {}
         
         try:
             # Construct Claude Code command
@@ -241,6 +265,12 @@ class SimpleClaudeRunner:
                 )
                 
                 if result.returncode != 0:
+                    # Claude Code refuses a prompt over its limit before calling the API, exiting 1 with its result
+                    # ("Prompt is too long") on stdout. Retrying sends the same prompt, so it goes straight to the caller's
+                    # retry without the diff.
+                    parsed_ok, parsed_failure = parse_json_with_fallbacks(result.stdout, "Claude Code output")
+                    if parsed_ok and self._is_prompt_too_long(parsed_failure):
+                        return False, "PROMPT_TOO_LONG", {}
                     if attempt == NUM_RETRIES - 1:
                         error_details = f"Claude Code execution failed with return code {result.returncode}\n"
                         error_details += f"Stderr: {result.stderr}\n"
@@ -256,11 +286,7 @@ class SimpleClaudeRunner:
                 
                 if success:
                     # Check for "Prompt is too long" error that should trigger retry without diff
-                    if (isinstance(parsed_result, dict) and 
-                        parsed_result.get('type') == 'result' and 
-                        parsed_result.get('subtype') == 'success' and
-                        parsed_result.get('is_error') and
-                        parsed_result.get('result') == 'Prompt is too long'):
+                    if self._is_prompt_too_long(parsed_result):
                         return False, "PROMPT_TOO_LONG", {}
                     
                     # Check for error_during_execution that should trigger retry
@@ -286,6 +312,14 @@ class SimpleClaudeRunner:
         except Exception as e:
             return False, f"Claude Code execution error: {str(e)}", {}
     
+    @staticmethod
+    def _is_prompt_too_long(parsed: Any) -> bool:
+        """Whether Claude Code's JSON result is its refusal of a prompt over its limit, whatever its exit code."""
+        if not isinstance(parsed, dict) or parsed.get('type') != 'result' or not parsed.get('is_error'):
+            return False
+        text = parsed.get('result')
+        return isinstance(text, str) and text.strip().lower().startswith('prompt is too long')
+
     def _extract_security_findings(self, claude_output: Any) -> Dict[str, Any]:
         """Extract security findings from Claude's JSON response."""
         if isinstance(claude_output, dict):
@@ -577,7 +611,20 @@ def main():
         except Exception as e:
             print(json.dumps({'error': f'Failed to fetch PR data: {str(e)}'}))
             sys.exit(EXIT_GENERAL_ERROR)
-                
+
+        # The files left out of the scan, named in the job's summary so a reader knows the scan didn't read them.
+        summary_path = os.environ.get('GITHUB_STEP_SUMMARY')
+        if github_client.excluded_files and summary_path:
+            try:
+                with open(summary_path, 'a', encoding='utf-8') as summary:
+                    summary.write(f"### Security review: {len(github_client.excluded_files)} file(s) left out of the scan\n\n")
+                    summary.write("By `exclude-files` or `exclude-directories`. The scan didn't read these:\n\n")
+                    for name in github_client.excluded_files:
+                        summary.write(f"- `{name.replace('`', '')}`\n")
+                    summary.write("\n")
+            except OSError as e:
+                print(f"[Warning] Couldn't write the left-out files to the job summary: {e}", file=sys.stderr)
+
         # Generate security audit prompt
         prompt = get_security_audit_prompt(pr_data, pr_diff, custom_scan_instructions=custom_scan_instructions)
         
@@ -593,7 +640,10 @@ def main():
             prompt_without_diff = get_security_audit_prompt(pr_data, pr_diff, include_diff=False, custom_scan_instructions=custom_scan_instructions)
             print(f"[Info] New prompt length: {len(prompt_without_diff)} characters", file=sys.stderr)
             success, error_msg, results = claude_runner.run_security_audit(repo_dir, prompt_without_diff)
-        
+            if not success and error_msg == "PROMPT_TOO_LONG":
+                error_msg = (f"the pull request is too large to scan: its prompt was too long with its diff "
+                             f"({len(prompt.encode('utf-8'))} bytes) and without it ({len(prompt_without_diff.encode('utf-8'))} bytes)")
+
         if not success:
             print(json.dumps({'error': f'Security audit failed: {error_msg}'}))
             sys.exit(EXIT_GENERAL_ERROR)

@@ -18,6 +18,11 @@ inputs:
     required: false
     default: ''
 
+  exclude-files:
+    description: 'Comma-separated list of file patterns (fnmatch, on the repository path; * also crosses a /) to exclude from scanning, such as */Migrations/*.Designer.cs. Each file left out is named in the job summary.'
+    required: false
+    default: ''
+
   claudecode-timeout:
     description: 'Timeout for ClaudeCode analysis in minutes'
     required: false
@@ -202,6 +207,7 @@ runs:
         ANTHROPIC_API_KEY: ${{ inputs.claude-api-key }}
         ENABLE_CLAUDE_FILTERING: 'true' 
         EXCLUDE_DIRECTORIES: ${{ inputs.exclude-directories }}
+        EXCLUDE_FILES: ${{ inputs.exclude-files }}
         FALSE_POSITIVE_FILTERING_INSTRUCTIONS: ${{ inputs.false-positive-filtering-instructions }}
         CUSTOM_SECURITY_SCAN_INSTRUCTIONS: ${{ inputs.custom-security-scan-instructions }}
         CLAUDE_MODEL: ${{ inputs.claude-model }}
