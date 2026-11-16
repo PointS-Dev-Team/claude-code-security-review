@@ -269,6 +269,20 @@ more content
             assert 'b.py' in result
             assert 'c.py' not in result
 
+    def test_exclude_files_leaves_out_matching_files_only(self):
+        """EXCLUDE_FILES leaves out files by pattern, a * crossing folders, and keeps their neighbours."""
+        designer = 'src/Olympus.Infrastructure/Data/Migrations/20261116_AddX.Designer.cs'
+        migration = 'src/Olympus.Infrastructure/Data/Migrations/20261116_AddX.cs'
+        agora_designer = 'src/Agora.Infrastructure/Migrations/20261116_AddY.Designer.cs'
+        elsewhere = 'src/Olympus.Web/Forms/Settings.Designer.cs'
+        diff = "".join(f"diff --git a/{f} b/{f}\n+line of {f}\n" for f in (designer, migration, agora_designer, elsewhere))
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token', 'EXCLUDE_FILES': ' */Migrations/*.Designer.cs , '}):
+            client = GitHubActionClient()
+            assert [client._is_excluded(f) for f in (designer, migration, agora_designer, elsewhere)] == [True, False, True, False]
+            result = client._filter_generated_files(diff)
+        assert designer not in result and agora_designer not in result
+        assert migration in result and elsewhere in result
+
 
 class TestGitHubAPIIntegration:
     """Test GitHub API integration scenarios."""

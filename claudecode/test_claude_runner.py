@@ -216,6 +216,20 @@ class TestSimpleClaudeRunner:
         assert mock_run.call_count == 2  # Retried once
     
     @patch('subprocess.run')
+    def test_run_security_audit_prompt_too_long_on_a_failed_exit(self, mock_run):
+        """Claude Code's refusal of a prompt over its limit, exit 1, is PROMPT_TOO_LONG at once, not three blind retries."""
+        refusal = {"type": "result", "subtype": "success", "is_error": True, "result": "Prompt is too long",
+                   "duration_api_ms": 0, "total_cost_usd": 0}
+        mock_run.return_value = Mock(returncode=1, stdout=json.dumps(refusal), stderr='')
+
+        runner = SimpleClaudeRunner()
+        with patch('pathlib.Path.exists', return_value=True):
+            success, error, results = runner.run_security_audit(Path('/tmp/test'), "test prompt")
+
+        assert (success, error, results) == (False, "PROMPT_TOO_LONG", {})
+        assert mock_run.call_count == 1
+
+    @patch('subprocess.run')
     def test_run_security_audit_retry_on_error_during_execution(self, mock_run):
         """Test retry on error_during_execution result."""
         error_result = {
