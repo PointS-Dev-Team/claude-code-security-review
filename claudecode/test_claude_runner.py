@@ -230,6 +230,16 @@ class TestSimpleClaudeRunner:
         assert mock_run.call_count == 1
 
     @patch('subprocess.run')
+    def test_run_security_audit_prompt_over_the_stdin_limit_is_not_sent(self, mock_run):
+        """A prompt over Claude Code's 10 MB stdin limit is PROMPT_TOO_LONG without calling it."""
+        runner = SimpleClaudeRunner()
+        with patch('pathlib.Path.exists', return_value=True):
+            success, error, results = runner.run_security_audit(Path('/tmp/test'), "x" * (10 * 1024 * 1024 + 1))
+
+        assert (success, error, results) == (False, "PROMPT_TOO_LONG", {})
+        assert mock_run.call_count == 0
+
+    @patch('subprocess.run')
     def test_run_security_audit_retry_on_error_during_execution(self, mock_run):
         """Test retry on error_during_execution result."""
         error_result = {

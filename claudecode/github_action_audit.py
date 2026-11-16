@@ -201,6 +201,10 @@ class GitHubActionClient:
         return ''.join(filtered_sections)
 
 
+# Claude Code's limit on piped stdin, where the prompt goes.
+MAX_STDIN_BYTES = 10 * 1024 * 1024
+
+
 class SimpleClaudeRunner:
     """Simplified Claude Code runner for GitHub Actions."""
     
@@ -232,6 +236,11 @@ class SimpleClaudeRunner:
         prompt_size = len(prompt.encode('utf-8'))
         if prompt_size > 1024 * 1024:  # 1MB
             print(f"[Warning] Large prompt size: {prompt_size / 1024 / 1024:.2f}MB", file=sys.stderr)
+        # Claude Code refuses piped stdin over 10 MB ("piped stdin input exceeds 10MB", exit 1) before it reads the prompt,
+        # so such a prompt goes straight to the caller's retry without the diff, as one it calls too long does.
+        if prompt_size > MAX_STDIN_BYTES:
+            print(f"[Info] Prompt over Claude Code's stdin limit ({prompt_size} bytes), not sent", file=sys.stderr)
+            return False, "PROMPT_TOO_LONG", {}
         
         try:
             # Construct Claude Code command
