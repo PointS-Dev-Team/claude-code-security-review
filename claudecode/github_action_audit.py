@@ -38,6 +38,13 @@ class AuditError(ValueError):
     """Raised when security audit operations fail."""
     pass
 
+# The files API's page size, and its pages up to the 3000 files GitHub lists for a PR.
+FILES_PER_PAGE = 100
+MAX_FILES_PAGES = 30
+
+# Stands in for the changes of a file the files API gives no patch for. It starts with a letter, which no patch line does.
+NO_PATCH_MARKER = "Patch not available: the GitHub API gave no patch for this file (binary, too large, or no line changes)."
+
 class GitHubActionClient:
     """Simplified GitHub API client for GitHub Actions environment."""
     
@@ -84,11 +91,7 @@ class GitHubActionClient:
         response.raise_for_status()
         pr_data = response.json()
         
-        # Get PR files with pagination support
-        files_url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}/files?per_page=100"
-        response = requests.get(files_url, headers=self.headers)
-        response.raise_for_status()
-        files_data = response.json()
+        files_data = self._get_pr_files(repo_name, pr_number)
         self.excluded_files = [f['filename'] for f in files_data if self._is_excluded(f['filename'])]
         
         return {
@@ -142,10 +145,55 @@ class GitHubActionClient:
         headers['Accept'] = 'application/vnd.github.diff'
         
         response = requests.get(url, headers=headers)
+        # GitHub refuses the diff media type with 406 Not Acceptable for a PR past its diff limit (about 300 files),
+        # so such a PR's diff is put together from its files' patches instead.
+        if response.status_code == 406:
+            logger.info("GitHub refused the PR's diff as too large (406); building it from the files API")
+            diff = self._filter_generated_files(self._diff_from_files(self._get_pr_files(repo_name, pr_number)))
+            without_patch = sum(1 for line in diff.splitlines() if line == NO_PATCH_MARKER)
+            if without_patch:
+                logger.warning(f"{without_patch} file(s) in the PR's diff have no patch from the GitHub API "
+                               f"(binary, too large, or no line changes): the diff names them without their changes")
+            return diff
         response.raise_for_status()
-        
+
         return self._filter_generated_files(response.text)
-    
+
+    def _get_pr_files(self, repo_name: str, pr_number: int) -> List[Dict[str, Any]]:
+        """Every file of the PR from the files API, read page by page (GitHub lists at most 3000)."""
+        files_url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}/files?per_page={FILES_PER_PAGE}"
+        files: List[Dict[str, Any]] = []
+        for page in range(1, MAX_FILES_PAGES + 1):
+            # The first page keeps the URL a PR of up to 100 files has always used.
+            url = files_url if page == 1 else f"{files_url}&page={page}"
+            response = requests.get(url, headers=self.headers)
+            response.raise_for_status()
+            page_files = response.json()
+            files.extend(page_files)
+            if len(page_files) < FILES_PER_PAGE or 'rel="next"' not in response.headers.get('Link', ''):
+                return files
+        logger.warning(f"The PR lists more than {len(files)} files: GitHub returns no more, so the rest aren't in the scan")
+        return files
+
+    @staticmethod
+    def _diff_from_files(files: List[Dict[str, Any]]) -> str:
+        """A unified diff put together from the files API's per-file patches, one section per file."""
+        sections = []
+        for f in files:
+            new_path = f['filename']
+            old_path = f.get('previous_filename') or new_path
+            section = f"diff --git a/{old_path} b/{new_path}\n"
+            patch = f.get('patch')
+            if not patch:
+                # A binary or too-large file has no patch: it is named, with a marker, rather than left out.
+                sections.append(f"{section}{NO_PATCH_MARKER}\n")
+                continue
+            old_side = '/dev/null' if f.get('status') == 'added' else f"a/{old_path}"
+            new_side = '/dev/null' if f.get('status') == 'removed' else f"b/{new_path}"
+            section += f"--- {old_side}\n+++ {new_side}\n{patch}"
+            sections.append(section if section.endswith('\n') else section + '\n')
+        return ''.join(sections)
+
     def _is_excluded(self, filepath: str) -> bool:
         """Check if a file should be excluded based on directory patterns or file patterns."""
         for pattern in self.excluded_file_patterns:

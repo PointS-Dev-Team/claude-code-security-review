@@ -260,3 +260,115 @@ class TestDeploymentPRDetection:
         for title in non_deployment_titles:
             assert not re.match(deployment_pattern, title, re.IGNORECASE), f"Incorrectly matched non-deployment PR: {title}"
 
+
+
+class TestLargePRDiffFallback:
+    """A PR too large for GitHub's diff media type gets its diff from the files API, read page by page."""
+
+    DIFF_URL = 'https://api.github.com/repos/owner/repo/pulls/123'
+    FILES_URL = 'https://api.github.com/repos/owner/repo/pulls/123/files?per_page=100'
+
+    @staticmethod
+    def _client():
+        import os
+        from unittest.mock import patch
+        from claudecode.github_action_audit import GitHubActionClient
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token'}):
+            return GitHubActionClient()
+
+    @staticmethod
+    def _diff_refused():
+        """The diff request's answer for a large PR: 406, which raise_for_status would raise."""
+        from unittest.mock import Mock
+        import requests
+        response = Mock()
+        response.status_code = 406
+        response.raise_for_status.side_effect = requests.HTTPError(
+            "406 Client Error: Not Acceptable for url: https://api.github.com/repos/owner/repo/pulls/123")
+        return response
+
+    @staticmethod
+    def _files_page(files, next_page=None):
+        from unittest.mock import Mock
+        response = Mock()
+        response.status_code = 200
+        response.raise_for_status.return_value = None
+        response.json.return_value = files
+        response.headers = {'Link': f'<https://api.github.com/x?page={next_page}>; rel="next"'} if next_page else {}
+        return response
+
+    def test_406_on_the_diff_builds_it_from_each_files_patch(self):
+        from unittest.mock import patch
+        files = [
+            {'filename': 'src/app.py', 'status': 'modified', 'patch': '@@ -1 +1 @@\n-old\n+new'},
+            {'filename': 'src/new.py', 'status': 'added', 'patch': '@@ -0,0 +1 @@\n+created'},
+            {'filename': 'src/gone.py', 'status': 'removed', 'patch': '@@ -1 +0,0 @@\n-deleted'},
+            {'filename': 'src/to.py', 'previous_filename': 'src/from.py', 'status': 'renamed',
+             'patch': '@@ -1 +1 @@\n-a\n+b'},
+        ]
+        client = self._client()
+        with patch('requests.get') as mock_get:
+            mock_get.side_effect = [self._diff_refused(), self._files_page(files)]
+            result = client.get_pr_diff('owner/repo', 123)
+
+        assert mock_get.call_args_list[1][0][0] == self.FILES_URL
+        assert result == (
+            "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -1 +1 @@\n-old\n+new\n"
+            "diff --git a/src/new.py b/src/new.py\n--- /dev/null\n+++ b/src/new.py\n@@ -0,0 +1 @@\n+created\n"
+            "diff --git a/src/gone.py b/src/gone.py\n--- a/src/gone.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-deleted\n"
+            "diff --git a/src/from.py b/src/to.py\n--- a/src/from.py\n+++ b/src/to.py\n@@ -1 +1 @@\n-a\n+b\n"
+        )
+
+    def test_a_files_list_over_several_pages_is_read_whole(self):
+        from unittest.mock import patch
+        def page_of(start, count):
+            return [{'filename': f'f{i}.py', 'status': 'modified', 'additions': 1, 'deletions': 0, 'changes': 1,
+                     'patch': '@@ -1 +1 @@\n+x'} for i in range(start, start + count)]
+        pr_response = self._files_page(None)
+        pr_response.json.return_value = {
+            'number': 123, 'title': 'Big', 'body': '', 'user': {'login': 'u'},
+            'created_at': '', 'updated_at': '', 'state': 'open',
+            'head': {'ref': 'h', 'sha': 'abc', 'repo': {'full_name': 'owner/repo'}},
+            'base': {'ref': 'main', 'sha': 'def'}, 'additions': 250, 'deletions': 0, 'changed_files': 250,
+        }
+        client = self._client()
+        with patch('requests.get') as mock_get:
+            mock_get.side_effect = [pr_response, self._files_page(page_of(0, 100), next_page=2),
+                                    self._files_page(page_of(100, 100), next_page=3),
+                                    self._files_page(page_of(200, 50))]
+            result = client.get_pr_data('owner/repo', 123)
+
+        assert [c[0][0] for c in mock_get.call_args_list[1:]] == [
+            self.FILES_URL, self.FILES_URL + '&page=2', self.FILES_URL + '&page=3']
+        assert len(result['files']) == 250
+        assert result['files'][249]['filename'] == 'f249.py'
+
+    def test_a_file_without_a_patch_is_named_with_the_not_available_marker(self):
+        from unittest.mock import patch
+        from claudecode.github_action_audit import NO_PATCH_MARKER
+        files = [
+            {'filename': 'img/logo.png', 'status': 'modified'},
+            {'filename': 'src/app.py', 'status': 'modified', 'patch': '@@ -1 +1 @@\n+x'},
+        ]
+        client = self._client()
+        with patch('requests.get') as mock_get, patch('claudecode.github_action_audit.logger') as mock_logger:
+            mock_get.side_effect = [self._diff_refused(), self._files_page(files)]
+            result = client.get_pr_diff('owner/repo', 123)
+
+        assert result.startswith(f"diff --git a/img/logo.png b/img/logo.png\n{NO_PATCH_MARKER}\ndiff --git a/src/app.py")
+        assert mock_logger.warning.call_count == 1
+        assert mock_logger.warning.call_args[0][0].startswith('1 file(s)')
+
+    def test_a_diff_error_other_than_406_still_raises(self):
+        from unittest.mock import Mock, patch
+        import pytest
+        import requests
+        response = Mock()
+        response.status_code = 500
+        response.raise_for_status.side_effect = requests.HTTPError("500 Server Error")
+        client = self._client()
+        with patch('requests.get') as mock_get:
+            mock_get.return_value = response
+            with pytest.raises(requests.HTTPError, match="500 Server Error"):
+                client.get_pr_diff('owner/repo', 123)
+        assert mock_get.call_count == 1

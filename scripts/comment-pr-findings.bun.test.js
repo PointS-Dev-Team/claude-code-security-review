@@ -632,5 +632,41 @@ describe('comment-pr-findings.js', () => {
       expect(consoleLogSpy).toHaveBeenCalledWith('File not-in-diff.py not in PR diff, skipping');
       expect(consoleLogSpy).toHaveBeenCalledWith('No findings to comment on PR diff');
     });
+
+    test('should find a file listed past the first page of PR files', async () => {
+      const mockFindings = [{ file: 'later.py', line: 1, description: 'Test', severity: 'HIGH' }];
+
+      readFileSyncSpy.mockImplementation((path) => {
+        if (path.includes('github-event.json')) {
+          return JSON.stringify({
+            pull_request: { number: 123, head: { sha: 'abc123' } }
+          });
+        }
+        if (path === 'findings.json') {
+          return JSON.stringify(mockFindings);
+        }
+      });
+
+      const firstPage = Array.from({ length: 100 }, (_, i) => ({ filename: `file${i}.py` }));
+      spawnSyncSpy.mockImplementation((cmd, args, options) => {
+        if (cmd === 'gh' && args.includes('api')) {
+          const endpoint = args[1];
+          if (endpoint.includes('/pulls/123/files')) {
+            const page = endpoint.endsWith('&page=1') ? firstPage : [{ filename: 'later.py' }];
+            return { status: 0, stdout: JSON.stringify(page), stderr: '' };
+          }
+          if (endpoint.includes('/pulls/123/comments') && args.includes('GET')) {
+            return { status: 0, stdout: '[]', stderr: '' };
+          }
+          return { status: 0, stdout: '{}', stderr: '' };
+        }
+        return { status: 0, stdout: '{}', stderr: '' };
+      });
+
+      await import('./comment-pr-findings.js');
+      expect(spawnSyncSpy).toHaveBeenCalledWith('gh', expect.arrayContaining(['api', expect.stringContaining('/pulls/123/files?per_page=100&page=2')]), expect.any(Object));
+      expect(consoleLogSpy).not.toHaveBeenCalledWith('File later.py not in PR diff, skipping');
+      expect(consoleLogSpy).toHaveBeenCalledWith('Created review with 1 inline comments');
+    });
   });
 });
