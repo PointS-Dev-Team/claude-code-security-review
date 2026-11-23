@@ -119,6 +119,12 @@ async function run() {
       if (pageFiles.length < 100) break;
     }
 
+    // GitHub lists at most 3000 of a PR's files: a finding in one past them has no diff to place its comment on
+    const changedFiles = context.payload.pull_request?.changed_files;
+    if (Number.isInteger(changedFiles) && prFiles.length < changedFiles) {
+      console.log(`GitHub listed ${prFiles.length} of the PR's ${changedFiles} changed files; findings in the other ${changedFiles - prFiles.length} aren't commented on`);
+    }
+
     // Create a map of file paths to their diff information
     const fileMap = {};
     prFiles.forEach(file => {

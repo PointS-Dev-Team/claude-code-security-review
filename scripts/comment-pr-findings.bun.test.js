@@ -668,5 +668,44 @@ describe('comment-pr-findings.js', () => {
       expect(consoleLogSpy).not.toHaveBeenCalledWith('File later.py not in PR diff, skipping');
       expect(consoleLogSpy).toHaveBeenCalledWith('Created review with 1 inline comments');
     });
+
+    test('should log the PR files GitHub did not list against its changed_files', async () => {
+      const mockFindings = [{ file: 'file0.py', line: 1, description: 'Test', severity: 'HIGH' }];
+
+      readFileSyncSpy.mockImplementation((path) => {
+        if (path.includes('github-event.json')) {
+          return JSON.stringify({
+            pull_request: { number: 123, head: { sha: 'abc123' }, changed_files: 250 }
+          });
+        }
+        if (path === 'findings.json') {
+          return JSON.stringify(mockFindings);
+        }
+      });
+
+      // At GitHub's cap its pages stop full, and the page after them is empty
+      const pages = {
+        1: Array.from({ length: 100 }, (_, i) => ({ filename: `file${i}.py` })),
+        2: Array.from({ length: 100 }, (_, i) => ({ filename: `file${100 + i}.py` })),
+      };
+      spawnSyncSpy.mockImplementation((cmd, args, options) => {
+        if (cmd === 'gh' && args.includes('api')) {
+          const endpoint = args[1];
+          if (endpoint.includes('/pulls/123/files')) {
+            const page = Number(endpoint.match(/&page=(\d+)/)[1]);
+            return { status: 0, stdout: JSON.stringify(pages[page] || []), stderr: '' };
+          }
+          if (endpoint.includes('/pulls/123/comments') && args.includes('GET')) {
+            return { status: 0, stdout: '[]', stderr: '' };
+          }
+          return { status: 0, stdout: '{}', stderr: '' };
+        }
+        return { status: 0, stdout: '{}', stderr: '' };
+      });
+
+      await import('./comment-pr-findings.js');
+      expect(consoleLogSpy).toHaveBeenCalledWith("GitHub listed 200 of the PR's 250 changed files; findings in the other 50 aren't commented on");
+      expect(consoleLogSpy).toHaveBeenCalledWith('Created review with 1 inline comments');
+    });
   });
 });
