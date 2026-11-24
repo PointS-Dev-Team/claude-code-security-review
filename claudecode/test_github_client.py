@@ -309,8 +309,7 @@ class TestGitHubAPIIntegration:
     
     @patch('requests.get')
     def test_pagination_not_needed_for_pr_files(self, mock_get):
-        """Test that PR files endpoint returns all files without pagination."""
-        # GitHub API returns up to 3000 files per PR without pagination
+        """A full page of files with no Link to a next page is the whole list, read in one request."""
         large_file_list = [
             {
                 'filename': f'file{i}.py',
@@ -341,7 +340,8 @@ class TestGitHubAPIIntegration:
         
         files_response = Mock()
         files_response.json.return_value = large_file_list
-        
+        files_response.headers = {}
+
         mock_get.side_effect = [pr_response, files_response]
         
         with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token'}):

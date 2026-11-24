@@ -38,6 +38,13 @@ class AuditError(ValueError):
     """Raised when security audit operations fail."""
     pass
 
+# The files API's page size, and its pages up to the 3000 files GitHub lists for a PR.
+FILES_PER_PAGE = 100
+MAX_FILES_PAGES = 30
+
+# Stands in for the changes of a file the files API gives no patch for. It starts with a letter, which no patch line does.
+NO_PATCH_MARKER = "Patch not available: the GitHub API gave no patch for this file (binary, too large, or no line changes)."
+
 class GitHubActionClient:
     """Simplified GitHub API client for GitHub Actions environment."""
     
@@ -67,6 +74,13 @@ class GitHubActionClient:
             print(f"[Debug] Excluded file patterns: {self.excluded_file_patterns}", file=sys.stderr)
         # The PR's files left out of the scan, by either rule, for the job's summary.
         self.excluded_files: List[str] = []
+        # What the scan has of the PR short of all of it, said plainly in its results and the job's summary.
+        self.scan_notes: List[str] = []
+
+    def _note(self, text: str) -> None:
+        """Logs a part of the PR the scan doesn't have whole, and keeps it for the results and the job's summary."""
+        logger.warning(text)
+        self.scan_notes.append(text)
 
     def get_pr_data(self, repo_name: str, pr_number: int) -> Dict[str, Any]:
         """Get PR metadata and files from GitHub API.
@@ -84,11 +98,12 @@ class GitHubActionClient:
         response.raise_for_status()
         pr_data = response.json()
         
-        # Get PR files with pagination support
-        files_url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}/files?per_page=100"
-        response = requests.get(files_url, headers=self.headers)
-        response.raise_for_status()
-        files_data = response.json()
+        files_data = self._get_pr_files(repo_name, pr_number)
+        # GitHub lists at most 3000 of a PR's files, and its last page then has no link to a next one, so the
+        # shortfall shows only against the PR's own count.
+        if len(files_data) < pr_data['changed_files']:
+            self._note(f"GitHub listed {len(files_data)} of the PR's {pr_data['changed_files']} changed files; "
+                       f"the other {pr_data['changed_files'] - len(files_data)} aren't in this scan")
         self.excluded_files = [f['filename'] for f in files_data if self._is_excluded(f['filename'])]
         
         return {
@@ -142,10 +157,55 @@ class GitHubActionClient:
         headers['Accept'] = 'application/vnd.github.diff'
         
         response = requests.get(url, headers=headers)
+        # GitHub refuses the diff media type with 406 Not Acceptable for a PR past its diff limit (about 300 files),
+        # so such a PR's diff is put together from its files' patches instead.
+        if response.status_code == 406:
+            logger.info("GitHub refused the PR's diff as too large (406); building it from the files API")
+            diff = self._filter_generated_files(self._diff_from_files(self._get_pr_files(repo_name, pr_number)))
+            # Lines split on \n only: splitlines() also splits on \x0c and other separators a patch line can hold.
+            without_patch = diff.split('\n').count(NO_PATCH_MARKER)
+            if without_patch:
+                self._note(f"{without_patch} file(s) in the PR's diff have no patch from the GitHub API "
+                           f"(binary, too large, or no line changes), so the scan has their names without their changes")
+            return diff
         response.raise_for_status()
-        
+
         return self._filter_generated_files(response.text)
-    
+
+    def _get_pr_files(self, repo_name: str, pr_number: int) -> List[Dict[str, Any]]:
+        """Every file of the PR from the files API, read page by page (GitHub lists at most 3000: get_pr_data notes the rest)."""
+        files_url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}/files?per_page={FILES_PER_PAGE}"
+        files: List[Dict[str, Any]] = []
+        for page in range(1, MAX_FILES_PAGES + 1):
+            # The first page keeps the URL a PR of up to 100 files has always used.
+            url = files_url if page == 1 else f"{files_url}&page={page}"
+            response = requests.get(url, headers=self.headers)
+            response.raise_for_status()
+            page_files = response.json()
+            files.extend(page_files)
+            if len(page_files) < FILES_PER_PAGE or 'rel="next"' not in response.headers.get('Link', ''):
+                break
+        return files
+
+    @staticmethod
+    def _diff_from_files(files: List[Dict[str, Any]]) -> str:
+        """A unified diff put together from the files API's per-file patches, one section per file."""
+        sections = []
+        for f in files:
+            new_path = f['filename']
+            old_path = f.get('previous_filename') or new_path
+            section = f"diff --git a/{old_path} b/{new_path}\n"
+            patch = f.get('patch')
+            if not patch:
+                # A binary or too-large file has no patch: it is named, with a marker, rather than left out.
+                sections.append(f"{section}{NO_PATCH_MARKER}\n")
+                continue
+            old_side = '/dev/null' if f.get('status') == 'added' else f"a/{old_path}"
+            new_side = '/dev/null' if f.get('status') == 'removed' else f"b/{new_path}"
+            section += f"--- {old_side}\n+++ {new_side}\n{patch}"
+            sections.append(section if section.endswith('\n') else section + '\n')
+        return ''.join(sections)
+
     def _is_excluded(self, filepath: str) -> bool:
         """Check if a file should be excluded based on directory patterns or file patterns."""
         for pattern in self.excluded_file_patterns:
@@ -552,6 +612,25 @@ def _is_finding_in_excluded_directory(finding: Dict[str, Any], github_client: Gi
     return github_client._is_excluded(file_path)
 
 
+DIFF_LEFT_OUT_NOTE = ("The PR's diff was too long to send, so the scan was given its files by name only, "
+                      "without their changes")
+
+
+def write_scan_notes_to_summary(scan_notes: List[str]) -> None:
+    """Says in the job's summary what the scan has of the PR short of all of it, as its results do."""
+    summary_path = os.environ.get('GITHUB_STEP_SUMMARY')
+    if not scan_notes or not summary_path:
+        return
+    try:
+        with open(summary_path, 'a', encoding='utf-8') as summary:
+            summary.write("### Security review: not all of the PR is in this scan\n\n")
+            for note in scan_notes:
+                summary.write(f"- {note}\n")
+            summary.write("\n")
+    except OSError as e:
+        print(f"[Warning] Couldn't write the scan's notes to the job summary: {e}", file=sys.stderr)
+
+
 def main():
     """Main execution function for GitHub Action."""
     try:
@@ -625,6 +704,9 @@ def main():
             except OSError as e:
                 print(f"[Warning] Couldn't write the left-out files to the job summary: {e}", file=sys.stderr)
 
+        # What the scan has of the PR short of all of it, for its results and the job's summary.
+        scan_notes = list(github_client.scan_notes)
+
         # Generate security audit prompt
         prompt = get_security_audit_prompt(pr_data, pr_diff, custom_scan_instructions=custom_scan_instructions)
         
@@ -637,6 +719,7 @@ def main():
         # If prompt is too long, retry without diff
         if not success and error_msg == "PROMPT_TOO_LONG":
             print(f"[Info] Prompt too long, retrying without diff. Original prompt length: {len(prompt)} characters", file=sys.stderr)
+            scan_notes.append(DIFF_LEFT_OUT_NOTE)
             prompt_without_diff = get_security_audit_prompt(pr_data, pr_diff, include_diff=False, custom_scan_instructions=custom_scan_instructions)
             print(f"[Info] New prompt length: {len(prompt_without_diff)} characters", file=sys.stderr)
             success, error_msg, results = claude_runner.run_security_audit(repo_dir, prompt_without_diff)
@@ -668,6 +751,8 @@ def main():
         output = {
             'pr_number': pr_number,
             'repo': repo_name,
+            # Near the top, so the results preview in the action's log shows it however many findings follow.
+            'scan_notes': scan_notes,
             'findings': kept_findings,
             'analysis_summary': results.get('analysis_summary', {}),
             'filtering_summary': {
@@ -679,6 +764,8 @@ def main():
             }
         }
         
+        write_scan_notes_to_summary(scan_notes)
+
         # Output JSON to stdout
         print(json.dumps(output, indent=2))
         

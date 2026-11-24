@@ -260,3 +260,212 @@ class TestDeploymentPRDetection:
         for title in non_deployment_titles:
             assert not re.match(deployment_pattern, title, re.IGNORECASE), f"Incorrectly matched non-deployment PR: {title}"
 
+
+
+class TestLargePRDiffFallback:
+    """A PR too large for GitHub's diff media type gets its diff from the files API, read page by page."""
+
+    DIFF_URL = 'https://api.github.com/repos/owner/repo/pulls/123'
+    FILES_URL = 'https://api.github.com/repos/owner/repo/pulls/123/files?per_page=100'
+
+    @staticmethod
+    def _client():
+        import os
+        from unittest.mock import patch
+        from claudecode.github_action_audit import GitHubActionClient
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'test-token'}):
+            return GitHubActionClient()
+
+    @staticmethod
+    def _diff_refused():
+        """The diff request's answer for a large PR: 406, which raise_for_status would raise."""
+        from unittest.mock import Mock
+        import requests
+        response = Mock()
+        response.status_code = 406
+        response.raise_for_status.side_effect = requests.HTTPError(
+            "406 Client Error: Not Acceptable for url: https://api.github.com/repos/owner/repo/pulls/123")
+        return response
+
+    @staticmethod
+    def _files_page(files, next_page=None):
+        from unittest.mock import Mock
+        response = Mock()
+        response.status_code = 200
+        response.raise_for_status.return_value = None
+        response.json.return_value = files
+        response.headers = {'Link': f'<https://api.github.com/x?page={next_page}>; rel="next"'} if next_page else {}
+        return response
+
+    def test_406_on_the_diff_builds_it_from_each_files_patch(self):
+        from unittest.mock import patch
+        files = [
+            {'filename': 'src/app.py', 'status': 'modified', 'patch': '@@ -1 +1 @@\n-old\n+new'},
+            {'filename': 'src/new.py', 'status': 'added', 'patch': '@@ -0,0 +1 @@\n+created'},
+            {'filename': 'src/gone.py', 'status': 'removed', 'patch': '@@ -1 +0,0 @@\n-deleted'},
+            {'filename': 'src/to.py', 'previous_filename': 'src/from.py', 'status': 'renamed',
+             'patch': '@@ -1 +1 @@\n-a\n+b'},
+        ]
+        client = self._client()
+        with patch('requests.get') as mock_get:
+            mock_get.side_effect = [self._diff_refused(), self._files_page(files)]
+            result = client.get_pr_diff('owner/repo', 123)
+
+        assert mock_get.call_args_list[1][0][0] == self.FILES_URL
+        assert result == (
+            "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -1 +1 @@\n-old\n+new\n"
+            "diff --git a/src/new.py b/src/new.py\n--- /dev/null\n+++ b/src/new.py\n@@ -0,0 +1 @@\n+created\n"
+            "diff --git a/src/gone.py b/src/gone.py\n--- a/src/gone.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-deleted\n"
+            "diff --git a/src/from.py b/src/to.py\n--- a/src/from.py\n+++ b/src/to.py\n@@ -1 +1 @@\n-a\n+b\n"
+        )
+
+    def test_a_files_list_over_several_pages_is_read_whole(self):
+        from unittest.mock import patch
+        def page_of(start, count):
+            return [{'filename': f'f{i}.py', 'status': 'modified', 'additions': 1, 'deletions': 0, 'changes': 1,
+                     'patch': '@@ -1 +1 @@\n+x'} for i in range(start, start + count)]
+        pr_response = self._files_page(None)
+        pr_response.json.return_value = {
+            'number': 123, 'title': 'Big', 'body': '', 'user': {'login': 'u'},
+            'created_at': '', 'updated_at': '', 'state': 'open',
+            'head': {'ref': 'h', 'sha': 'abc', 'repo': {'full_name': 'owner/repo'}},
+            'base': {'ref': 'main', 'sha': 'def'}, 'additions': 250, 'deletions': 0, 'changed_files': 250,
+        }
+        client = self._client()
+        with patch('requests.get') as mock_get:
+            mock_get.side_effect = [pr_response, self._files_page(page_of(0, 100), next_page=2),
+                                    self._files_page(page_of(100, 100), next_page=3),
+                                    self._files_page(page_of(200, 50))]
+            result = client.get_pr_data('owner/repo', 123)
+
+        assert [c[0][0] for c in mock_get.call_args_list[1:]] == [
+            self.FILES_URL, self.FILES_URL + '&page=2', self.FILES_URL + '&page=3']
+        assert len(result['files']) == 250
+        assert result['files'][249]['filename'] == 'f249.py'
+        assert client.scan_notes == []
+
+    def test_a_file_without_a_patch_is_named_with_the_not_available_marker(self):
+        from unittest.mock import patch
+        from claudecode.github_action_audit import NO_PATCH_MARKER
+        files = [
+            {'filename': 'img/logo.png', 'status': 'modified'},
+            {'filename': 'src/app.py', 'status': 'modified', 'patch': '@@ -1 +1 @@\n+x'},
+        ]
+        client = self._client()
+        with patch('requests.get') as mock_get, patch('claudecode.github_action_audit.logger') as mock_logger:
+            mock_get.side_effect = [self._diff_refused(), self._files_page(files)]
+            result = client.get_pr_diff('owner/repo', 123)
+
+        assert result.startswith(f"diff --git a/img/logo.png b/img/logo.png\n{NO_PATCH_MARKER}\ndiff --git a/src/app.py")
+        assert mock_logger.warning.call_count == 1
+        assert mock_logger.warning.call_args[0][0].startswith('1 file(s)')
+
+    def test_a_diff_error_other_than_406_still_raises(self):
+        from unittest.mock import Mock, patch
+        import pytest
+        import requests
+        response = Mock()
+        response.status_code = 500
+        response.raise_for_status.side_effect = requests.HTTPError("500 Server Error")
+        client = self._client()
+        with patch('requests.get') as mock_get:
+            mock_get.return_value = response
+            with pytest.raises(requests.HTTPError, match="500 Server Error"):
+                client.get_pr_diff('owner/repo', 123)
+        assert mock_get.call_count == 1
+
+    def test_the_marker_count_splits_lines_on_newlines_only(self):
+        from unittest.mock import patch
+        from claudecode.github_action_audit import NO_PATCH_MARKER
+        # A form feed in a patch line is no line break: splitlines() would count the marker after it as a second line.
+        files = [
+            {'filename': 'img/logo.png', 'status': 'modified'},
+            {'filename': 'src/app.py', 'status': 'modified', 'patch': f'@@ -1 +1 @@\n+x\x0c{NO_PATCH_MARKER}'},
+        ]
+        client = self._client()
+        with patch('requests.get') as mock_get:
+            mock_get.side_effect = [self._diff_refused(), self._files_page(files)]
+            client.get_pr_diff('owner/repo', 123)
+
+        assert len(client.scan_notes) == 1
+        assert client.scan_notes[0].startswith('1 file(s) in the PR')
+
+
+class TestScanNotes:
+    """What the scan has of a PR short of all of it is said in its results and the job's summary, not only the log."""
+
+    PR = {
+        'number': 123, 'title': 'Big', 'body': '', 'user': {'login': 'u'},
+        'created_at': '', 'updated_at': '', 'state': 'open',
+        'head': {'ref': 'h', 'sha': 'abc', 'repo': {'full_name': 'owner/repo'}},
+        'base': {'ref': 'main', 'sha': 'def'}, 'additions': 1, 'deletions': 0,
+    }
+    AUDIT_OK = (True, "", {'findings': [], 'analysis_summary': {'files_reviewed': 1, 'review_completed': True}})
+
+    @staticmethod
+    def _response(json_value=None, text='', next_page=False):
+        from unittest.mock import Mock
+        response = Mock()
+        response.status_code = 200
+        response.raise_for_status.return_value = None
+        response.json.return_value = json_value
+        response.text = text
+        response.headers = {'Link': '<https://api.github.com/x?page=2>; rel="next"'} if next_page else {}
+        return response
+
+    def _run_main(self, tmp_path, capsys, changed_files, pages, audit_results):
+        """Runs main on a PR whose files API answers `pages`, with Claude Code answering `audit_results` in turn."""
+        import json
+        import os
+        import pytest
+        from unittest.mock import Mock, patch
+        from claudecode.github_action_audit import main
+        responses = [self._response(dict(self.PR, changed_files=changed_files))]
+        responses += [self._response(page, next_page=i < len(pages) - 1) for i, page in enumerate(pages)]
+        responses.append(self._response(text='diff --git a/f0.py b/f0.py\n--- a/f0.py\n+++ b/f0.py\n@@ -1 +1 @@\n+x\n'))
+        runner = Mock()
+        runner.validate_claude_available.return_value = (True, "")
+        runner.run_security_audit.side_effect = audit_results
+        summary = tmp_path / 'summary.md'
+        env = {'GITHUB_REPOSITORY': 'owner/repo', 'PR_NUMBER': '123', 'GITHUB_TOKEN': 't',
+               'GITHUB_STEP_SUMMARY': str(summary), 'REPO_PATH': str(tmp_path)}
+        with patch.dict(os.environ, env), patch('requests.get', side_effect=responses), \
+                patch('claudecode.github_action_audit.SimpleClaudeRunner', return_value=runner), \
+                patch('claudecode.github_action_audit.FindingsFilter') as filter_class:
+            filter_class.return_value.filter_findings.return_value = (
+                True, {'filtered_findings': [], 'excluded_findings': [], 'analysis_summary': {}}, None)
+            with pytest.raises(SystemExit) as exit_info:
+                main()
+        assert exit_info.value.code == 0
+        results = json.loads(capsys.readouterr().out)
+        return results, (summary.read_text(encoding='utf-8') if summary.exists() else '')
+
+    @staticmethod
+    def _files(start, count):
+        return [{'filename': f'f{i}.py', 'status': 'modified', 'additions': 1, 'deletions': 0, 'changes': 1,
+                 'patch': '@@ -1 +1 @@\n+x'} for i in range(start, start + count)]
+
+    def test_files_past_githubs_list_are_counted_in_the_results_and_the_summary(self, tmp_path, capsys):
+        # At GitHub's cap its last page is full and has no link to a next one, so only the PR's count shows the rest.
+        results, summary = self._run_main(tmp_path, capsys, changed_files=250,
+                                          pages=[self._files(0, 100), self._files(100, 100)],
+                                          audit_results=[self.AUDIT_OK])
+
+        line = "GitHub listed 200 of the PR's 250 changed files; the other 50 aren't in this scan"
+        assert results['scan_notes'] == [line]
+        assert f"- {line}\n" in summary
+
+    def test_the_retry_without_the_diff_is_said_in_the_results_and_the_summary(self, tmp_path, capsys):
+        from claudecode.github_action_audit import DIFF_LEFT_OUT_NOTE
+        results, summary = self._run_main(tmp_path, capsys, changed_files=1, pages=[self._files(0, 1)],
+                                          audit_results=[(False, "PROMPT_TOO_LONG", {}), self.AUDIT_OK])
+
+        assert results['scan_notes'] == [DIFF_LEFT_OUT_NOTE]
+        assert f"- {DIFF_LEFT_OUT_NOTE}\n" in summary
+
+    def test_a_whole_scan_has_no_notes_and_writes_none_to_the_summary(self, tmp_path, capsys):
+        results, summary = self._run_main(tmp_path, capsys, changed_files=1, pages=[self._files(0, 1)],
+                                          audit_results=[self.AUDIT_OK])
+
+        assert results['scan_notes'] == []
+        assert summary == ''

@@ -226,6 +226,7 @@ class TestMainFunction:
             'body': 'Description'
         }
         mock_client.get_pr_diff.return_value = "diff content"
+        mock_client.scan_notes = []  # read into the results
         mock_client_class.return_value = mock_client
         
         mock_runner = Mock()
@@ -296,6 +297,7 @@ class TestMainFunction:
         }
         mock_client.get_pr_diff.return_value = "diff content"
         mock_client._is_excluded.return_value = False  # Don't exclude any files in tests
+        mock_client.scan_notes = []  # read into the results
         mock_client_class.return_value = mock_client
         
         findings = [
@@ -385,6 +387,7 @@ class TestMainFunction:
         }
         mock_client.get_pr_diff.return_value = "diff content"
         mock_client._is_excluded.return_value = False  # Don't exclude any files in tests
+        mock_client.scan_notes = []  # read into the results
         mock_client_class.return_value = mock_client
         
         findings = [{'file': 'test.py', 'line': 10, 'severity': 'HIGH', 'description': 'Issue'}]
@@ -443,6 +446,7 @@ class TestMainFunction:
         mock_client.get_pr_data.return_value = {'number': 123, 'title': 'Test', 'body': ''}
         mock_client.get_pr_diff.return_value = "diff"
         mock_client._is_excluded.return_value = False  # Don't exclude any files in tests
+        mock_client.scan_notes = []  # read into the results
         mock_client_class.return_value = mock_client
         
         findings = [
@@ -527,6 +531,7 @@ class TestAuditFailureModes:
         mock_client = Mock()
         mock_client.get_pr_data.return_value = {'number': 123}
         mock_client.get_pr_diff.return_value = "diff"
+        mock_client.scan_notes = []  # read into the results
         mock_client_class.return_value = mock_client
         
         mock_runner = Mock()

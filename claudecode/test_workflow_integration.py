@@ -406,7 +406,8 @@ class TestWorkflowEdgeCases:
         
         files_response = Mock()
         files_response.json.return_value = large_files
-        
+        files_response.headers = {}  # no Link to a next page
+
         # Create massive diff
         diff_parts = []
         for i in range(500):
